@@ -70,6 +70,7 @@ python3 -m PyInstaller --noconfirm --clean --windowed --onedir --name VideoSubti
 3. 在「识别与翻译设置」中：
    - 选择 Whisper 模型（`small` 是速度与准确率的平衡；`tiny/base` 快但粗糙，`medium/large-v3` 更准更慢）。
    - 填写 LLM 的 API 地址、API Key 和模型名称，可点「测试连接」验证。
+   - 配置可点「保存为预设」存为命名预设，之后在「LLM 预设」下拉框中一键切换。
      - OpenAI: `https://api.openai.com/v1`
      - DeepSeek: `https://api.deepseek.com/v1`
      - Ollama 本地: `http://localhost:11434/v1`

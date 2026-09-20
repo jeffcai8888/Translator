@@ -8,7 +8,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from pipeline import run_pipeline, app_dir
 from llm_translator import test_connection, LLMError
@@ -24,6 +24,39 @@ def user_data_dir() -> str:
 
 
 CONFIG_PATH = os.path.join(user_data_dir(), "config.json")
+
+
+def _enable_macos_edit_shortcuts(root: tk.Tk) -> None:
+    """macOS 下显式绑定 Cmd+C/V/X/A。
+
+    打包成 .app 后 Tk 默认菜单的编辑快捷键经常失效，导致输入框无法
+    复制粘贴；这里直接在控件类上绑定虚拟事件来修复。
+    """
+    if sys.platform != "darwin":
+        return
+
+    def _forward(event, name):
+        event.widget.event_generate(name)
+        return "break"
+
+    def _select_all(event):
+        w = event.widget
+        try:
+            if isinstance(w, tk.Text):
+                w.tag_add("sel", "1.0", "end-1c")
+                w.mark_set("insert", "1.0")
+            else:  # Entry / ttk.Entry / Combobox
+                w.select_range(0, "end")
+                w.icursor("end")
+        except tk.TclError:
+            pass
+        return "break"
+
+    for cls in ("Entry", "TEntry", "TCombobox", "Text"):
+        root.bind_class(cls, "<Command-c>", lambda e: _forward(e, "<<Copy>>"))
+        root.bind_class(cls, "<Command-x>", lambda e: _forward(e, "<<Cut>>"))
+        root.bind_class(cls, "<Command-v>", lambda e: _forward(e, "<<Paste>>"))
+        root.bind_class(cls, "<Command-a>", _select_all)
 
 # (显示名, whisper 语言代码)
 SOURCE_LANGUAGES = [
@@ -64,6 +97,7 @@ DEFAULT_CONFIG = {
     "bilingual": True,
     "source_lang": "auto",
     "target_lang": "中文（简体）",
+    "llm_presets": [],  # [{"name", "base_url", "api_key", "model"}, ...]
 }
 
 
@@ -75,10 +109,12 @@ class App(tk.Tk):
         self.minsize(700, 600)
 
         self.config_data = self._load_config()
+        self.presets: list[dict] = list(self.config_data.get("llm_presets") or [])
         self.msg_queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
         self.cancel_event = threading.Event()
 
+        _enable_macos_edit_shortcuts(self)
         self._build_ui()
         self.after(100, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -102,6 +138,7 @@ class App(tk.Tk):
             "bilingual": self.bilingual_var.get(),
             "source_lang": self._source_lang_code(),
             "target_lang": self.target_var.get().strip(),
+            "llm_presets": self.presets,
         })
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -180,6 +217,19 @@ class App(tk.Tk):
                         variable=self.transcribe_only_var).grid(
             row=3, column=3, sticky="w", padx=12, pady=4)
 
+        # LLM 预设
+        ttk.Label(model_frame, text="LLM 预设:").grid(row=4, column=0, sticky="w", padx=6, pady=4)
+        self.preset_var = tk.StringVar()
+        self.preset_combo = ttk.Combobox(
+            model_frame, textvariable=self.preset_var, state="readonly",
+            width=20, values=[p["name"] for p in self.presets])
+        self.preset_combo.grid(row=4, column=1, sticky="w", padx=6, pady=4)
+        self.preset_combo.bind("<<ComboboxSelected>>", self._apply_preset)
+        ttk.Button(model_frame, text="保存为预设",
+                   command=self._save_preset).grid(row=4, column=2, sticky="w", padx=6, pady=4)
+        ttk.Button(model_frame, text="删除预设",
+                   command=self._delete_preset).grid(row=4, column=3, sticky="w", padx=6, pady=4)
+
         # 操作区
         op_frame = ttk.Frame(main)
         op_frame.pack(fill="x", **pad)
@@ -212,6 +262,58 @@ class App(tk.Tk):
     def _source_lang_code(self) -> str:
         name = self.source_combo.get()
         return next((c for n, c in SOURCE_LANGUAGES if n == name), "auto")
+
+    # ---------- LLM 预设 ----------
+    def _apply_preset(self, _event=None):
+        """下拉选择预设后，把配置填进输入框。"""
+        name = self.preset_var.get()
+        preset = next((p for p in self.presets if p["name"] == name), None)
+        if not preset:
+            return
+        self.base_url_var.set(preset.get("base_url", ""))
+        self.api_key_var.set(preset.get("api_key", ""))
+        self.model_var.set(preset.get("model", ""))
+        self._log(f"已切换到 LLM 预设: {name}")
+
+    def _save_preset(self):
+        """把当前输入框的 LLM 配置保存为预设（同名覆盖）。"""
+        cfg = {
+            "base_url": self.base_url_var.get().strip(),
+            "api_key": self.api_key_var.get().strip(),
+            "model": self.model_var.get().strip(),
+        }
+        if not cfg["base_url"] or not cfg["model"]:
+            messagebox.showwarning("提示", "请先填写 API 地址和模型名称，再保存预设。")
+            return
+        name = simpledialog.askstring(
+            "保存预设", "预设名称：",
+            initialvalue=self.preset_var.get() or cfg["model"], parent=self)
+        if not name or not name.strip():
+            return
+        cfg["name"] = name.strip()
+        for i, p in enumerate(self.presets):
+            if p["name"] == cfg["name"]:
+                self.presets[i] = cfg
+                break
+        else:
+            self.presets.append(cfg)
+        self.preset_combo["values"] = [p["name"] for p in self.presets]
+        self.preset_var.set(cfg["name"])
+        self._save_config()
+        self._log(f"已保存 LLM 预设: {cfg['name']}")
+
+    def _delete_preset(self):
+        name = self.preset_var.get()
+        if not name:
+            messagebox.showwarning("提示", "请先在下拉框中选择要删除的预设。")
+            return
+        if not messagebox.askyesno("删除预设", f"确定删除预设「{name}」吗？"):
+            return
+        self.presets = [p for p in self.presets if p["name"] != name]
+        self.preset_combo["values"] = [p["name"] for p in self.presets]
+        self.preset_var.set("")
+        self._save_config()
+        self._log(f"已删除 LLM 预设: {name}")
 
     def _log(self, msg: str):
         self.log_text.configure(state="normal")

@@ -57,3 +57,9 @@ coll = COLLECT(
     upx_exclude=[],
     name='VideoSubtitleTranslator',
 )
+app = BUNDLE(
+    coll,
+    name='VideoSubtitleTranslator.app',
+    icon=None,
+    bundle_identifier=None,
+)

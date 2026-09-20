@@ -24,11 +24,21 @@ def app_dir() -> str:
 
 
 def find_ffmpeg() -> str:
-    """优先使用与程序同目录的 ffmpeg，否则用 PATH 中的。"""
+    """优先使用与程序同目录的 ffmpeg，否则用 PATH 中的。
+
+    macOS 从 Finder 启动的 .app 继承不到 shell 的 PATH（没有
+    /opt/homebrew/bin），因此额外检查 Homebrew 的常见安装位置。
+    """
     exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-    local = os.path.join(app_dir(), exe_name)
-    if os.path.isfile(local):
-        return local
+    candidates = [os.path.join(app_dir(), exe_name)]
+    if sys.platform == "darwin":
+        candidates += [
+            "/opt/homebrew/bin/ffmpeg",  # Apple Silicon Homebrew
+            "/usr/local/bin/ffmpeg",     # Intel Homebrew / 手动安装
+        ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
     found = shutil.which("ffmpeg")
     if found:
         return found
