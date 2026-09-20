@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller 构建产物
+build/
+dist/
+
+# 本地配置与运行日志（config.json 含 LLM API Key，切勿提交）
+config.json
+crash.log
+cli_run.log
+
+# 测试产物
+test/
