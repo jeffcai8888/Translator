@@ -16,3 +16,6 @@ test/
 
 # 本地虚拟环境
 .venv/
+
+# 发布产物
+release/

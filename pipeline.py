@@ -48,10 +48,47 @@ def find_ffmpeg() -> str:
     )
 
 
-def extract_audio(video_path: str, wav_path: str) -> None:
-    """用 ffmpeg 从视频中提取 16kHz 单声道 WAV 音频。"""
-    cmd = [
-        find_ffmpeg(), "-y", "-i", video_path,
+def is_url(path: str) -> bool:
+    """是否为 http(s) 链接（网盘直链等）。"""
+    return path.lower().startswith(("http://", "https://"))
+
+
+def default_remote_output_dir() -> str:
+    """远程链接视频的字幕默认输出目录（本地文件保存在视频同目录）。"""
+    d = os.path.join(os.path.expanduser("~"), "Movies", "VideoSubtitleTranslator")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _url_basename(url: str) -> str:
+    """从 URL 中提取可读的文件名（去掉扩展名），用于命名字幕文件。"""
+    from urllib.parse import urlparse, unquote
+    name = os.path.basename(unquote(urlparse(url).path))
+    stem, _ = os.path.splitext(name)
+    return stem or "remote_video"
+
+
+_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+       "AppleWebKit/537.36 (KHTML, like Gecko) "
+       "Chrome/126.0.0.0 Safari/537.36")
+
+
+def extract_audio(video_path: str, wav_path: str, headers: str = "") -> None:
+    """用 ffmpeg 从视频中提取 16kHz 单声道 WAV 音频。
+
+    video_path 可以是本地路径或 http(s) 直链；headers 为可选的自定义
+    请求头（如 "Cookie: ..."），用于需要登录态的网盘直链。
+    """
+    cmd = [find_ffmpeg(), "-y"]
+    if is_url(video_path):
+        cmd += ["-user_agent", _UA]
+        if headers.strip():
+            # ffmpeg 要求请求头以 \r\n 结尾
+            cmd += ["-headers", headers.strip() + "\r\n"]
+        cmd += ["-reconnect", "1", "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5"]
+    cmd += [
+        "-i", video_path,
         "-vn", "-ac", "1", "-ar", "16000",
         "-c:a", "pcm_s16le", wav_path,
     ]
@@ -59,6 +96,61 @@ def extract_audio(video_path: str, wav_path: str) -> None:
                           encoding="utf-8", errors="replace")
     if proc.returncode != 0 or not os.path.exists(wav_path):
         raise PipelineError(f"音频提取失败:\n{proc.stderr[-800:]}")
+
+
+def throttled_download(url: str, dest: str, rate_bps: float,
+                       headers: str = "",
+                       progress_cb=None, cancel_event=None) -> int:
+    """限速下载 URL 到本地文件，返回下载字节数。
+
+    单连接顺序读取 + 限速，使下载行为接近在线播放，降低网盘风控特征。
+    rate_bps: 字节/秒；<= 0 表示不限速。progress_cb(downloaded, total)，
+    total 未知时为 0。
+    """
+    import time
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    for line in headers.strip().splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            req.add_header(k.strip(), v.strip())
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        raise PipelineError(f"下载视频失败 HTTP {e.code}（链接可能已过期或需要更新 Cookie）") from e
+    except urllib.error.URLError as e:
+        raise PipelineError(f"无法连接视频链接: {e.reason}") from e
+
+    total = int(resp.headers.get("Content-Length") or 0)
+    downloaded = 0
+    start = time.monotonic()
+    chunk_size = 256 * 1024
+    try:
+        with resp, open(dest, "wb") as f:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError("已取消")
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if rate_bps > 0:
+                    expected = downloaded / rate_bps
+                    delay = expected - (time.monotonic() - start)
+                    if delay > 0:
+                        time.sleep(min(delay, 1.0))
+                if progress_cb:
+                    progress_cb(downloaded, total)
+    except InterruptedError:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise
+    return downloaded
 
 
 def transcribe(audio_path: str, model_size: str, language: str | None,
@@ -91,9 +183,14 @@ def run_pipeline(video_path: str, source_lang: str, target_lang: str,
                  whisper_model: str, llm_config: dict,
                  bilingual: bool, transcribe_only: bool,
                  output_path: str | None = None,
+                 headers: str = "",
+                 speed_limit_mbs: float = 0.0,
                  progress_cb=None, log_cb=None, cancel_event=None) -> str:
     """完整流程，返回生成的 SRT 路径。
 
+    video_path 可以是本地路径或 http(s) 直链（网盘直链等）；
+    headers 为访问直链时的可选自定义请求头（如 Cookie）；
+    speed_limit_mbs 为直链下载限速（MB/s），<= 0 表示不限速直读。
     progress_cb(stage, fraction): stage ∈ {"extract", "transcribe", "translate"}
     """
     def log(msg: str):
@@ -104,22 +201,48 @@ def run_pipeline(video_path: str, source_lang: str, target_lang: str,
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("已取消")
 
-    video_path = os.path.abspath(video_path)
-    if not os.path.isfile(video_path):
-        raise PipelineError(f"视频文件不存在: {video_path}")
+    remote = is_url(video_path)
+    if remote:
+        pass  # 远程链接无法预先校验，交给下载/提取环节处理
+    else:
+        video_path = os.path.abspath(video_path)
+        if not os.path.isfile(video_path):
+            raise PipelineError(f"视频文件不存在: {video_path}")
 
     if output_path is None:
-        stem, _ = os.path.splitext(video_path)
         suffix = "transcript" if transcribe_only else target_lang
-        output_path = f"{stem}.{suffix}.srt"
+        if remote:
+            output_path = os.path.join(
+                default_remote_output_dir(), f"{_url_basename(video_path)}.{suffix}.srt")
+        else:
+            stem, _ = os.path.splitext(video_path)
+            output_path = f"{stem}.{suffix}.srt"
 
     tmpdir = tempfile.mkdtemp(prefix="vidtrans_")
     wav_path = os.path.join(tmpdir, "audio.wav")
+    local_video: str | None = None
     try:
-        log("正在提取音频 ...")
         if progress_cb:
             progress_cb("extract", 0.0)
-        extract_audio(video_path, wav_path)
+        if remote and speed_limit_mbs > 0:
+            # 限速模式：先单连接节流下载到临时文件，再从本地提取音频。
+            # 下载行为接近在线播放，降低网盘风控特征。
+            from urllib.parse import urlparse, unquote
+            ext = os.path.splitext(unquote(urlparse(video_path).path))[1]
+            local_video = os.path.join(tmpdir, f"video{ext or '.mp4'}")
+            log(f"正在限速下载视频 ({speed_limit_mbs:g} MB/s) ...")
+            size = throttled_download(
+                video_path, local_video, speed_limit_mbs * 1024 * 1024,
+                headers=headers,
+                progress_cb=lambda d, t: progress_cb and progress_cb(
+                    "extract", (d / t * 0.9) if t else 0.0),
+                cancel_event=cancel_event,
+            )
+            log(f"下载完成 ({size / 1024 / 1024:.1f} MB)，正在提取音频 ...")
+            extract_audio(local_video, wav_path)
+        else:
+            log("正在从链接下载并提取音频 ..." if remote else "正在提取音频 ...")
+            extract_audio(video_path, wav_path, headers=headers)
         check_cancel()
 
         lang_code = None if source_lang == "auto" else source_lang
@@ -157,6 +280,14 @@ def run_pipeline(video_path: str, source_lang: str, target_lang: str,
     finally:
         try:
             os.remove(wav_path)
+        except OSError:
+            pass
+        if local_video:
+            try:
+                os.remove(local_video)
+            except OSError:
+                pass
+        try:
             os.rmdir(tmpdir)
         except OSError:
             pass

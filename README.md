@@ -65,7 +65,7 @@ python3 -m PyInstaller --noconfirm --clean --windowed --onedir --name VideoSubti
 
 ## 使用说明
 
-1. 点击「浏览...」选择视频文件。
+1. 点击「浏览...」选择视频文件，或直接把 **http(s) 视频直链**粘贴到输入框（网盘直链见下文「网盘视频」）。
 2. 在「语言设置」中选择原视频语言（不确定可留「自动检测」）和目标语言；勾选「双语字幕」可同时保留原文。
 3. 在「识别与翻译设置」中：
    - 选择 Whisper 模型（`small` 是速度与准确率的平衡；`tiny/base` 快但粗糙，`medium/large-v3` 更准更慢）。
@@ -74,7 +74,15 @@ python3 -m PyInstaller --noconfirm --clean --windowed --onedir --name VideoSubti
      - OpenAI: `https://api.openai.com/v1`
      - DeepSeek: `https://api.deepseek.com/v1`
      - Ollama 本地: `http://localhost:11434/v1`
-4. 点击「开始生成字幕」。完成后 SRT 文件保存在视频同目录，文件名形如 `视频名.中文（简体）.srt`。
+4. 点击「开始生成字幕」。完成后 SRT 文件保存在视频同目录，文件名形如 `视频名.中文（简体）.srt`；使用直链时保存在 `~/Movies/VideoSubtitleTranslator/` 下。
+
+## 网盘视频（115 等）
+
+115 网盘没有官方本地挂载和开放 API，可选两种方式：
+
+- **本地挂载**：用 CloudDrive2 等工具把网盘挂载为本地文件夹后，直接「浏览...」选中挂载目录里的视频即可，与本地文件用法完全相同。（第三方挂载属于网盘条款灰色地带，请自行权衡账号风控风险。）
+- **视频直链**：把视频的 http(s) 直链（如 AList 生成的链接）粘贴到视频文件输入框；如果链接需要登录态（如 115 官方下载链接），在「直链请求头」一栏填入 `Cookie: 你的cookie`。程序边下边转录，字幕输出到 `~/Movies/VideoSubtitleTranslator/`。
+  - 「限速(MB/s)」填大于 0 的值时，改为先单连接节流下载到临时文件再提取音频（下载行为接近在线播放，降低网盘风控特征，视频处理完后自动删除）；填 0 则不限速、直接边下边转。
 
 设置会自动保存到 `config.json`，下次启动自动恢复。
 

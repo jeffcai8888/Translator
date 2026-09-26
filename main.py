@@ -10,7 +10,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from pipeline import run_pipeline, app_dir
+from pipeline import run_pipeline, app_dir, is_url
 from llm_translator import test_connection, LLMError
 
 def user_data_dir() -> str:
@@ -98,6 +98,7 @@ DEFAULT_CONFIG = {
     "source_lang": "auto",
     "target_lang": "中文（简体）",
     "llm_presets": [],  # [{"name", "base_url", "api_key", "model"}, ...]
+    "speed_limit": 0,   # 直链下载限速 MB/s，0 = 不限速
 }
 
 
@@ -139,6 +140,7 @@ class App(tk.Tk):
             "source_lang": self._source_lang_code(),
             "target_lang": self.target_var.get().strip(),
             "llm_presets": self.presets,
+            "speed_limit": self._speed_limit(),
         })
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -160,6 +162,21 @@ class App(tk.Tk):
             side="left", fill="x", expand=True, padx=6, pady=6)
         ttk.Button(file_frame, text="浏览...", command=self._browse).pack(
             side="left", padx=6, pady=6)
+
+        # 直链请求头（可选）
+        headers_frame = ttk.Frame(main)
+        headers_frame.pack(fill="x", padx=8)
+        ttk.Label(headers_frame, text="直链请求头:").pack(side="left", padx=(6, 4))
+        self.headers_var = tk.StringVar()
+        ttk.Entry(headers_frame, textvariable=self.headers_var).pack(
+            side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Label(headers_frame, text="限速(MB/s):").pack(side="left", padx=(6, 4))
+        self.speed_limit_var = tk.StringVar(
+            value=str(self.config_data.get("speed_limit", 0) or ""))
+        ttk.Entry(headers_frame, textvariable=self.speed_limit_var, width=6).pack(
+            side="left", padx=(0, 4))
+        ttk.Label(headers_frame, text="（直链可填 Cookie；限速 0=不限）",
+                  foreground="gray").pack(side="left", padx=(4, 6))
 
         # 语言选项
         lang_frame = ttk.LabelFrame(main, text="语言设置")
@@ -263,6 +280,13 @@ class App(tk.Tk):
         name = self.source_combo.get()
         return next((c for n, c in SOURCE_LANGUAGES if n == name), "auto")
 
+    def _speed_limit(self) -> float:
+        """解析限速输入，非法值视为不限速（0）。"""
+        try:
+            return max(float(self.speed_limit_var.get().strip() or 0), 0.0)
+        except ValueError:
+            return 0.0
+
     # ---------- LLM 预设 ----------
     def _apply_preset(self, _event=None):
         """下拉选择预设后，把配置填进输入框。"""
@@ -341,8 +365,10 @@ class App(tk.Tk):
 
     def _start(self):
         video = self.video_var.get().strip()
-        if not video or not os.path.isfile(video):
-            messagebox.showwarning("提示", "请选择有效的视频文件。")
+        if is_url(video):
+            pass  # 远程直链交给 ffmpeg 校验
+        elif not video or not os.path.isfile(video):
+            messagebox.showwarning("提示", "请选择有效的视频文件，或粘贴 http(s) 视频直链。")
             return
         transcribe_only = self.transcribe_only_var.get()
         llm_config = {
@@ -369,6 +395,8 @@ class App(tk.Tk):
             llm_config=llm_config,
             bilingual=self.bilingual_var.get(),
             transcribe_only=transcribe_only,
+            headers=self.headers_var.get().strip(),
+            speed_limit_mbs=self._speed_limit(),
             progress_cb=lambda stage, frac: self.msg_queue.put(("progress", (stage, frac))),
             log_cb=lambda msg: self.msg_queue.put(("log", msg)),
             cancel_event=self.cancel_event,
@@ -469,6 +497,10 @@ def _run_cli(argv):
     parser.add_argument("--src", default=None)
     parser.add_argument("--dst", default=None)
     parser.add_argument("--no-translate", action="store_true")
+    parser.add_argument("--headers", default="",
+                        help="访问视频直链时的自定义请求头，如 'Cookie: ...'")
+    parser.add_argument("--speed-limit", type=float, default=None,
+                        help="直链下载限速 MB/s，0 或省略 = 不限速")
     args = parser.parse_args(argv)
 
     cfg = dict(DEFAULT_CONFIG)
@@ -503,6 +535,9 @@ def _run_cli(argv):
             },
             bilingual=cfg.get("bilingual", True),
             transcribe_only=args.no_translate,
+            headers=args.headers,
+            speed_limit_mbs=args.speed_limit
+            if args.speed_limit is not None else float(cfg.get("speed_limit", 0) or 0),
             log_cb=log,
             progress_cb=lambda s, f: log(f"[{s}] {f * 100:.0f}%"),
         )
