@@ -155,13 +155,28 @@ class App(tk.Tk):
         main.pack(fill="both", expand=True, padx=6, pady=6)
 
         # 视频文件
-        file_frame = ttk.LabelFrame(main, text="视频文件")
+        file_frame = ttk.LabelFrame(main, text="视频文件（可批量）")
         file_frame.pack(fill="x", **pad)
+        top_row = ttk.Frame(file_frame)
+        top_row.pack(fill="x", padx=6, pady=(6, 2))
         self.video_var = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self.video_var).pack(
-            side="left", fill="x", expand=True, padx=6, pady=6)
-        ttk.Button(file_frame, text="浏览...", command=self._browse).pack(
-            side="left", padx=6, pady=6)
+        ttk.Entry(top_row, textvariable=self.video_var).pack(
+            side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(top_row, text="浏览(多选)...", command=self._browse).pack(side="left")
+        ttk.Button(top_row, text="加入队列", command=self._add_to_queue).pack(side="left", padx=(6, 0))
+
+        # 待处理队列
+        queue_row = ttk.Frame(file_frame)
+        queue_row.pack(fill="x", padx=6, pady=(2, 6))
+        self.queue_list = tk.Listbox(queue_row, height=3, activestyle="none")
+        qscroll = ttk.Scrollbar(queue_row, command=self.queue_list.yview)
+        self.queue_list.configure(yscrollcommand=qscroll.set)
+        self.queue_list.pack(side="left", fill="x", expand=True)
+        qscroll.pack(side="left", fill="y", padx=(2, 6))
+        qbtns = ttk.Frame(queue_row)
+        qbtns.pack(side="left")
+        ttk.Button(qbtns, text="移除", width=6, command=self._remove_selected).pack(pady=(0, 2))
+        ttk.Button(qbtns, text="清空", width=6, command=self._clear_queue).pack()
 
         # 直链请求头（可选）
         headers_frame = ttk.Frame(main)
@@ -271,10 +286,45 @@ class App(tk.Tk):
         scroll.pack(side="right", fill="y", pady=6, padx=(0, 6))
 
     # ---------- 事件 ----------
+    # ---------- 文件队列 ----------
     def _browse(self):
-        path = filedialog.askopenfilename(filetypes=VIDEO_FILETYPES)
-        if path:
-            self.video_var.set(path)
+        """多选文件加入队列；只选一个时同时显示在输入框。"""
+        paths = filedialog.askopenfilenames(filetypes=VIDEO_FILETYPES)
+        if not paths:
+            return
+        for p in paths:
+            self._queue_append(p)
+        self.video_var.set(paths[-1])
+
+    def _queue_append(self, item: str):
+        item = item.strip()
+        if not item:
+            return
+        existing = self.queue_list.get(0, "end")
+        if item not in existing:
+            self.queue_list.insert("end", item)
+
+    def _add_to_queue(self):
+        """把输入框内容（本地路径或直链）加入队列。"""
+        item = self.video_var.get().strip()
+        if not item:
+            return
+        self._queue_append(item)
+
+    def _remove_selected(self):
+        for i in reversed(self.queue_list.curselection()):
+            self.queue_list.delete(i)
+
+    def _clear_queue(self):
+        self.queue_list.delete(0, "end")
+
+    def _collect_items(self) -> list[str]:
+        """待处理列表：队列优先；队列为空时用输入框内容（单文件兼容）。"""
+        items = list(self.queue_list.get(0, "end"))
+        entry = self.video_var.get().strip()
+        if not items and entry:
+            items = [entry]
+        return items
 
     def _source_lang_code(self) -> str:
         name = self.source_combo.get()
@@ -364,11 +414,14 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _start(self):
-        video = self.video_var.get().strip()
-        if is_url(video):
-            pass  # 远程直链交给 ffmpeg 校验
-        elif not video or not os.path.isfile(video):
-            messagebox.showwarning("提示", "请选择有效的视频文件，或粘贴 http(s) 视频直链。")
+        items = self._collect_items()
+        if not items:
+            messagebox.showwarning("提示", "请选择视频文件、粘贴 http(s) 直链，或先把它们加入队列。")
+            return
+        invalid = [v for v in items if not is_url(v) and not os.path.isfile(v)]
+        if invalid:
+            messagebox.showwarning(
+                "提示", "以下条目不是有效的本地文件或 http(s) 链接：\n" + "\n".join(invalid))
             return
         transcribe_only = self.transcribe_only_var.get()
         llm_config = {
@@ -387,8 +440,7 @@ class App(tk.Tk):
         self.progress["value"] = 0
         self.stage_var.set("运行中 ...")
 
-        args = dict(
-            video_path=video,
+        common = dict(
             source_lang=self._source_lang_code(),
             target_lang=self.target_var.get().strip() or "中文",
             whisper_model=self.whisper_var.get(),
@@ -397,21 +449,42 @@ class App(tk.Tk):
             transcribe_only=transcribe_only,
             headers=self.headers_var.get().strip(),
             speed_limit_mbs=self._speed_limit(),
-            progress_cb=lambda stage, frac: self.msg_queue.put(("progress", (stage, frac))),
             log_cb=lambda msg: self.msg_queue.put(("log", msg)),
             cancel_event=self.cancel_event,
         )
-        self.worker = threading.Thread(target=self._run, kwargs=args, daemon=True)
+        self.worker = threading.Thread(
+            target=self._run_batch, args=(items, common), daemon=True)
         self.worker.start()
 
-    def _run(self, **kwargs):
-        try:
-            out = run_pipeline(**kwargs)
-            self.msg_queue.put(("done", out))
-        except InterruptedError:
-            self.msg_queue.put(("cancelled", None))
-        except Exception as e:
-            self.msg_queue.put(("error", str(e)))
+    def _run_batch(self, items: list[str], common: dict):
+        """逐个处理队列文件：单个失败不中断，最后汇总。取消则中止整个队列。"""
+        n = len(items)
+        # 各阶段在单文件内的进度权重
+        weights = ({"extract": 0.3, "transcribe": 0.7} if common["transcribe_only"]
+                   else {"extract": 0.25, "transcribe": 0.45, "translate": 0.30})
+        stage_start = {}
+        acc = 0.0
+        for s, w in weights.items():
+            stage_start[s] = acc
+            acc += w
+
+        outputs, failures = [], []
+        for i, video in enumerate(items):
+            def progress_cb(stage, frac, i=i):
+                file_frac = stage_start.get(stage, 0.0) + weights.get(stage, 0.0) * frac
+                self.msg_queue.put(("progress", (stage, frac, i, n,
+                                                 (i + file_frac) / n)))
+            self.msg_queue.put(("log", f"—— [{i + 1}/{n}] {video}"))
+            try:
+                out = run_pipeline(video_path=video, progress_cb=progress_cb, **common)
+                outputs.append(out)
+            except InterruptedError:
+                self.msg_queue.put(("cancelled", (outputs, failures)))
+                return
+            except Exception as e:
+                failures.append((video, str(e)))
+                self.msg_queue.put(("log", f"失败: {video}\n  原因: {e}"))
+        self.msg_queue.put(("done", (outputs, failures)))
 
     def _cancel(self):
         self.cancel_event.set()
@@ -425,20 +498,29 @@ class App(tk.Tk):
                 if kind == "log":
                     self._log(payload)
                 elif kind == "progress":
-                    stage, frac = payload
-                    self.progress["value"] = frac * 100
-                    self.stage_var.set(f"{stage_names.get(stage, stage)} {frac * 100:.0f}%")
+                    stage, frac, i, n, overall = payload
+                    self.progress["value"] = overall * 100
+                    prefix = f"文件 {i + 1}/{n} · " if n > 1 else ""
+                    self.stage_var.set(
+                        f"{prefix}{stage_names.get(stage, stage)} {frac * 100:.0f}%")
                 elif kind == "done":
+                    outputs, failures = payload
                     self._finish()
-                    self._log(f"全部完成！字幕文件: {payload}")
-                    messagebox.showinfo("完成", f"字幕已生成:\n{payload}")
+                    for o in outputs:
+                        self._log(f"字幕已生成: {o}")
+                    summary = f"完成 {len(outputs)} 个"
+                    if failures:
+                        summary += (f"，失败 {len(failures)} 个：\n"
+                                    + "\n".join(v for v, _ in failures))
+                    self._log(f"批量任务结束：{summary}")
+                    if failures:
+                        messagebox.showwarning("完成（有失败）", summary)
+                    else:
+                        messagebox.showinfo("完成", "全部字幕已生成:\n" + "\n".join(outputs))
                 elif kind == "cancelled":
+                    outputs, failures = payload
                     self._finish()
-                    self._log("任务已取消。")
-                elif kind == "error":
-                    self._finish()
-                    self._log(f"出错: {payload}")
-                    messagebox.showerror("错误", payload)
+                    self._log(f"任务已取消（已完成 {len(outputs)} 个，失败 {len(failures)} 个）。")
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
@@ -489,10 +571,10 @@ def _enable_crash_log():
 
 
 def _run_cli(argv):
-    """无界面调试模式: main.py --cli <视频路径> [--model small] [--src auto] [--dst 语言] [--no-translate]"""
+    """无界面调试模式: main.py --cli <视频路径或直链> [更多文件...] [--model small] [--src auto] [--dst 语言] [--no-translate]"""
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("video")
+    parser.add_argument("video", nargs="+", help="一个或多个视频路径 / http(s) 直链")
     parser.add_argument("--model", default=None)
     parser.add_argument("--src", default=None)
     parser.add_argument("--dst", default=None)
@@ -522,32 +604,38 @@ def _run_cli(argv):
         except Exception:
             pass
 
+    common = dict(
+        source_lang=args.src or cfg.get("source_lang", "auto"),
+        target_lang=args.dst or cfg.get("target_lang", "中文（简体）"),
+        whisper_model=args.model or cfg.get("whisper_model", "small"),
+        llm_config={
+            "base_url": cfg.get("base_url", ""),
+            "api_key": cfg.get("api_key", ""),
+            "model": cfg.get("model", ""),
+        },
+        bilingual=cfg.get("bilingual", True),
+        transcribe_only=args.no_translate,
+        headers=args.headers,
+        speed_limit_mbs=args.speed_limit
+        if args.speed_limit is not None else float(cfg.get("speed_limit", 0) or 0),
+        log_cb=log,
+        progress_cb=lambda s, f: log(f"[{s}] {f * 100:.0f}%"),
+    )
+    n = len(args.video)
+    failures = 0
     try:
-        out = run_pipeline(
-            video_path=args.video,
-            source_lang=args.src or cfg.get("source_lang", "auto"),
-            target_lang=args.dst or cfg.get("target_lang", "中文（简体）"),
-            whisper_model=args.model or cfg.get("whisper_model", "small"),
-            llm_config={
-                "base_url": cfg.get("base_url", ""),
-                "api_key": cfg.get("api_key", ""),
-                "model": cfg.get("model", ""),
-            },
-            bilingual=cfg.get("bilingual", True),
-            transcribe_only=args.no_translate,
-            headers=args.headers,
-            speed_limit_mbs=args.speed_limit
-            if args.speed_limit is not None else float(cfg.get("speed_limit", 0) or 0),
-            log_cb=log,
-            progress_cb=lambda s, f: log(f"[{s}] {f * 100:.0f}%"),
-        )
-        log(f"DONE: {out}")
-        return 0
-    except Exception as e:
-        import traceback
-        log(f"ERROR: {e}")
-        log(traceback.format_exc())
-        return 1
+        for i, video in enumerate(args.video):
+            log(f"—— [{i + 1}/{n}] {video}")
+            try:
+                out = run_pipeline(video_path=video, **common)
+                log(f"DONE: {out}")
+            except Exception as e:
+                import traceback
+                failures += 1
+                log(f"ERROR: {e}")
+                log(traceback.format_exc())
+        log(f"批量结束：成功 {n - failures} / {n}")
+        return 1 if failures else 0
     finally:
         log_file.close()
 
